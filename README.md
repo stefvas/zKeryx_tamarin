@@ -34,7 +34,7 @@ The model provides mechanized symbolic verification of zKeryx's three protocol p
 
 
 
-### Development/Example Models (in backup/)### Development/Example Models (in backup/)
+### Development/Example Models ### Development/Example Models
 
 
 
