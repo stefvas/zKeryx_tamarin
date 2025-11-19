@@ -593,14 +593,6 @@ The Dolev-Yao adversary has:
 
 ### Future Work
 - Mechanized verification of post-quantum variant (ML-KEM, ML-DSA)
-- Computational security proofs (CryptoVerif/EasyCrypt)
-- Concurrent composition analysis
-- Performance-security tradeoff analysis
-
-## Citation
-
-If you use this Tamarin model in your research, please cite:
-
 
 
 ## Contact and Support
