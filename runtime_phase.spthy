@@ -1,0 +1,147 @@
+theory RuntimePhase
+begin
+
+builtins: hashing, signing, symmetric-encryption, asymmetric-encryption
+
+/* Optional abstract constructors (not strictly required in this file) */
+functions: kdf/2, digest_pre/3, digest_final/1, sid/1, inc/1
+
+/* Initialization: provision keys and baseline state */
+rule InitUA:
+  [ ]
+  --[ Fr(skua) ]->
+  [ UA_SK(skua), UA_PK(pk(skua)) ]
+
+rule InitSE:
+  [ ]
+  --[ Fr(ska), Fr(skvpe), Fr(nameAK) ]->
+  [ SE_Holds_AK(nameAK, ska, pk(ska)), SE_Holds_VPE(skvpe, pk(skvpe)), OnboardedVPE(nameAK, pk(skvpe)) ]
+
+rule InitPlatform:
+  [ ]
+  --[ Fr(m), Fr(sb) ]->
+  [ TSS_Meas(m), PCR_SB(sb), RefOK(m), ProcRefs(m) ]
+
+rule InitCounter:
+  [ ]
+  --[ Fr(nameAK), Fr(v0) ]->
+  [ MC(nameAK, v0) ]
+
+/* Start sessions (non-deterministic handles/nonces) */
+rule StartSessions:
+  [ ]
+  --[ Fr(nuv), Fr(nua) ]->
+  [ StartSessVPE(sid('vpe), nuv), StartSessAK(sid('ak), nua) ]
+
+/* VPE session: check join-consistency predicates and sign H(nu_ak) with measurement context */
+rule VPE_SignOtherNonce:
+  [ StartSessVPE(hvpe, nuv), StartSessAK(hak, nua), SE_Holds_VPE(skvpe, pkvpe), TSS_Meas(m), PCR_SB(sb) ]
+  --[ ]->
+  [ VPE_SignedSig(sign(<h(nua), hak, m, sb>, skvpe), hak, h(nua), m, sb) ]
+
+/* AK session: accumulate measurements, counters, VPE linkage; then authorize via UA ticket */
+rule AK_Authorize:
+  [ StartSessAK(hak, nua), SE_Holds_AK(nameAK, skap, pkap), OnboardedVPE(nameAK, pkvpe),
+    ProcRefs(R), MC(nameAK, v), RefOK(m), ValidatedState(nameAK, R, v), 
+    VPE_SignedSig(sigv, hak, h(nua), m, sb) ]
+  --[ Eq(verify(sigv, <h(nua), hak, m, sb>, pkvpe), true) ]->
+  [ AK_Authorized(hak) ]
+
+/* Signing evidence after authorization */
+rule SignAK:
+  [ AK_Authorized(hak), SE_Holds_AK(nameAK, skap, pkap), VerifierFresh(n) ]
+  --[ SignAKEv(nameAK, h(n)), SignWithKey(nameAK, n) ]->
+  [ ]
+
+/* Verifier accepts when seeing a signature event over its fresh nonce (abstracted) */
+rule VerifierAccepts:
+  [ SignAKEv(nameAK, h(n)), VerifierFresh(n) ]
+  --[ VerifierAccept(nameAK, h(n)) ]->
+  [ ]
+
+/* Verifier generates fresh challenge */
+rule VerifierChallenge:
+  [ ]
+  --[ Fr(n) ]->
+  [ VerifierFresh(n) ]
+
+/* Update preparation (abstract): UA computes t' for new digest and fresh challenge c' */
+rule UA_PrepareUpdate:
+  [ UA_SK(skua), SE_Holds_AK(nameAK, skap, pkap) ]
+  --[ Fr(R'), Fr(vnext), Fr(c') ]->
+  [ Out(<nameAK, R', vnext, sign(<nameAK, R', vnext>, skua), c'>) ]
+
+/* Update activation: deliver t' and c' via activate-credential; network delivery */
+rule Net_Deliver:
+  [ Out(x) ]
+  --[ ]->
+  [ In(x) ]
+
+rule SE_ActivateUpdate:
+  [ In(<nameAK, R', vnext, tsig, c'>) ]
+  --[ ]->
+  [ DeliveredTicket(nameAK, R', vnext, tsig), UpdateChallenge(c') ]
+
+/* Cryptographically verify UA's ticket and update process references */
+rule Verify_Ticket:
+  [ DeliveredTicket(nameAK, R', vnext, tsig), UA_PK(pkua), TSS_Meas(m) ]
+  --[ Eq(verify(tsig, <nameAK, R', vnext>, pkua), true) ]->
+  [ VerifiedTicket(nameAK, R', vnext), ProcRefs(R'), RefOK(R'), CurrentMeas(nameAK, m) ]
+
+/* Attack detection: authorization only proceeds if measurements match references (no attack) */
+rule ValidateMeasurements:
+  [ VerifiedTicket(nameAK, R', vnext), CurrentMeas(nameAK, m) ]
+  --[ Eq(R', m), NoAttack(nameAK, m) ]->
+  [ ValidatedState(nameAK, R', vnext) ]
+
+/* Monotonic counter increment gated by a verified update ticket */
+rule CounterIncrement:
+  [ ValidatedState(nameAK, R', vnext), MC(nameAK, v) ]
+  --[ CounterInc(nameAK, v, vnext), Lt(v, vnext) ]->
+  [ MC(nameAK, vnext), MC_IncEv(nameAK, v, vnext) ]
+
+/* Bridge update challenge into the verifier-fresh premise to reuse the signing flow,
+   gated on the existence of a counter increment */
+rule UpdateChallengeToVerifierFresh:
+  [ UpdateChallenge(c'), MC_IncEv(nameAK, v, vnext) ]
+  --[ ]->
+  [ VerifierFresh(c') ]
+
+/* Lemmas */
+
+/* Freshness and no-replay: each accepted (nameAK, h(n)) comes from exactly one SignAKEv and n was fresh */
+lemma freshness_no_replay:
+  "All nameAK hn i. (VerifierAccept(nameAK, hn))@i ==> (Ex n j. hn = h(n) & VerifierFresh(n)@j & (Ex k. SignAKEv(nameAK, hn)@k) & (All k1 k2. SignAKEv(nameAK, hn)@k1 & SignAKEv(nameAK, hn)@k2 ==> k1 = k2))"
+
+/* Policy admission: any SignAKEv implies VerifiedTicket and presence of measurements/counters and VPE linkage */
+lemma policy_admission:
+  "All nameAK hn i. SignAKEv(nameAK, hn)@i ==> (Ex R v hak nua m sb.
+    VerifiedTicket(nameAK, R, v) & ProcRefs(R) & MC(nameAK, v) & RefOK(R) & R = m &
+    (Ex k s. VPE_SignedSig(s, hak, h(nua), m, sb)@k))"
+
+/* Anti-rollback: counters are monotonic and any SignAKEv observes some counter value; since no decrement rule exists, v does not decrease along the trace */
+lemma anti_rollback_progress:
+  "All nameAK v1 v2 i j.
+     MC(nameAK, v1)@i & MC(nameAK, v2)@j & i < j & v1 != v2
+     ==> (Ex k vprev vnext. MC_IncEv(nameAK, vprev, vnext)@k & i < k & k <= j)"
+
+/* Stronger anti-rollback: counter values strictly increase per attestation key */
+lemma no_rollback:
+  "All nameAK v1 v2 i j.
+     SignAKEv(nameAK, _)@i & MC(nameAK, v1) &
+     SignAKEv(nameAK, _)@j & MC(nameAK, v2) &
+     i < j ==> v1 < v2"
+
+/* Counter increment requires strict ordering */
+lemma counter_strict_monotonic:
+  "All nameAK v vnext i.
+     CounterInc(nameAK, v, vnext)@i ==> v < vnext"
+
+lemma update_requires_increment:
+  "All nameAK n i. SignAKEv(nameAK, h(n))@i ==> (Ex k a b. MC_IncEv(nameAK, a, b)@k & k < i)"
+
+/* Measurement integrity: signed evidence requires valid measurements */
+lemma measurement_integrity:
+  "All nameAK hn i. SignAKEv(nameAK, hn)@i ==> (Ex R m. ProcRefs(R) & RefOK(m) & R = m)"
+
+end

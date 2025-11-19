@@ -1,0 +1,69 @@
+# A minimal Tamarin model of a finite-state machine with safe transitions
+# Demonstrates: linear state fact, transition events, safety and reachability lemmas
+
+theory StateMachine
+
+begin
+
+functions:
+  Init/0, A/0, B/0, DoneS/0
+
+# Action labels (events)
+actions:
+  InitEv/0, Step/2, Bad/0
+
+# We model the current state as a linear fact State(s).
+# Exactly one State fact is present and is consumed/produced by transitions.
+
+rules:
+
+  # Initial creation of the machine in state Init
+  rule CreateInit:
+    [ ] --[ InitEv() ]-> [ State(Init) ]
+
+  # Allowed transitions of the state machine
+  rule Init_to_A:
+    [ State(Init) ] --[ Step(Init, A) ]-> [ State(A) ]
+
+  rule A_to_B:
+    [ State(A) ] --[ Step(A, B) ]-> [ State(B) ]
+
+  rule B_to_A:
+    [ State(B) ] --[ Step(B, A) ]-> [ State(A) ]
+
+  rule B_to_Done:
+    [ State(B) ] --[ Step(B, DoneS) ]-> [ State(DoneS) ]
+
+  # An example of a forbidden transition guarded by an unprovable trigger.
+  # Since BadTrig() never appears, Bad() is unprovable in any trace.
+  rule A_to_Bad:
+    [ State(A), BadTrig() ] --[ Bad() ]-> [ ]
+
+
+lemmas:
+
+  # Safety: No Bad() event ever occurs.
+  lemma no_bad:
+    "All #i. not( Bad() @ i )"
+
+  # At any timepoint, there is at most one State fact (uniqueness at the same time).
+  lemma single_state_per_time:
+    "All s1 s2 #i. ( State(s1) @ i & State(s2) @ i ) ==> s1 = s2"
+
+  # Transition audit: any Step event corresponds to one of the allowed edges.
+  lemma only_allowed_steps:
+    "All s1 s2 #i.
+      Step(s1,s2) @ i ==> ((s1 = Init & s2 = A)
+                         | (s1 = A    & s2 = B)
+                         | (s1 = B    & s2 = A)
+                         | (s1 = B    & s2 = DoneS))"
+
+  # Reachability: there exists a trace that reaches state B.
+  lemma reach_B:
+    "Ex #i. State(B) @ i"
+
+  # Reachability: there exists a trace that reaches the terminal state DoneS.
+  lemma reach_Done:
+    "Ex #i. State(DoneS) @ i"
+
+end

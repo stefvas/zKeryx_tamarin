@@ -1,0 +1,70 @@
+theory JoinPhase
+
+builtins: hashing, signing, symmetric-encryption, asymmetric-encryption
+
+functions: kdf/2
+
+/* Facts/Events */
+/* UA packages join material bound to nameAK and embeds (vpepk, c) */
+mutable fact UA_Packaged(nameAK: pub, ekpk: pub, vpepk: pub, c: pub, r: fresh, c1: pub, c2: pub)
+
+/* SE successfully activates credential and imports VPE, outputs (t,c) */
+mutable fact SE_Activated(nameAK: pub, vpepk: pub, t: pub)
+
+/* SE signs c under VPE (abstracted event) */
+mutable fact VPE_Sign(vpepk: pub, c: pub)
+
+/* UA accepts join (on valid signature over fresh c matching its package) */
+mutable fact UA_Accepted(nameAK: pub, vpepk: pub, c: pub)
+
+/* Device and registry */
+mutable fact RegistryEK(ekpk: pub)
+mutable fact SE_Holds_EK(skek: priv)
+
+/* Join: UA packages using aenc(r, ekpk) and senc(<vpepk,t,c>, kdf(r,nameAK)); c is fresh */
+rule UA_Package:
+  [ Fr(r), Fr(c), RegistryEK(ekpk) ]
+  --[
+    ]->
+  let k = kdf(r, nameAK) in
+  let c2 = aenc(r, ekpk) in
+  let payload = <vpepk, t, c> in
+  let c1 = senc(payload, k) in
+  [ UA_Packaged(nameAK, ekpk, vpepk, c, r, c1, c2) ]
+
+/* SE activate-credential: dec ek, recompute kdf, dec payload; import vpepk and emit a signature event over c */
+rule SE_Activate:
+  [ UA_Packaged(nameAK, ekpk, vpepk, c, r, c1, c2), SE_Holds_EK(skek) ]
+  --[
+    ]->
+  let r' = adec(c2, skek) in
+  let k' = kdf(r', nameAK) in
+  let <vpepk, t, c> = sdec(c1, k') in
+  [ SE_Activated(nameAK, vpepk, t), VPE_Sign(vpepk, c) ]
+
+/* UA accepts only when observing a signature event for the exact (vpepk, c) it embedded; consuming the package prevents replay acceptance */
+rule UA_Accept:
+  [ UA_Packaged(nameAK, ekpk, vpepk, c, r, c1, c2), VPE_Sign(vpepk, c) ]
+  --[
+    ]->
+  [ UA_Accepted(nameAK, vpepk, c) ]
+
+/* Lemmas */
+
+/* Activation implies UA packaged for that nameAK */
+lemma onboarding_authenticity:
+  "All nameAK vpepk t. (SE_Activated(nameAK, vpepk, t)) ==> (Ex ekpk v c r c1 c2. UA_Packaged(nameAK, ekpk, v, c, r, c1, c2))"
+
+/* Uniqueness of VPE per attestation key name: cannot have two different VPEs bound to the same nameAK */
+lemma vpe_unique_for_nameAK:
+  "All nameAK v1 t1 v2 t2.
+     (SE_Activated(nameAK, v1, t1)) & (SE_Activated(nameAK, v2, t2))
+     ==> v1 = v2"
+
+/* Anti-replay at UA: the same (nameAK,vpepk,c) cannot lead to multiple acceptances */
+lemma no_replay_accept:
+  "All nameAK vpe c i j.
+     (UA_Accepted(nameAK, vpe, c))@i & (UA_Accepted(nameAK, vpe, c))@j
+     ==> i = j"
+
+end

@@ -1,0 +1,18 @@
+theory SimpleTest
+begin
+
+builtins: hashing, signing, symmetric-encryption, asymmetric-encryption
+
+functions: kdf/2
+
+/* Simple rule for testing */
+rule TestRule:
+  [ ]
+  --[ TestEvent('test') ]->
+  [ TestFact('result') ]
+
+/* Simple lemma with correct temporal variable syntax */
+lemma test_lemma:
+  "All x #i. TestEvent(x)@#i ==> (Ex #j. TestEvent(x)@#j & #j = #i)"
+
+end
