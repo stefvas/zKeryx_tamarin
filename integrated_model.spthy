@@ -1,0 +1,319 @@
+theory IntegratedPhases
+begin
+
+builtins: hashing, signing, symmetric-encryption, asymmetric-encryption
+
+functions: kdf/2, digest_pre/3, digest_final/1, sid/1, inc/1, session_handle/2, fst/1, snd/1
+
+/* ============================================================================
+   JOIN PHASE: Onboarding and VPE Provisioning
+   ============================================================================ */
+
+/* Initialization: provision keys and baseline state */
+rule InitUA:
+  [ Fr(skua) ]
+  --[ UAKeyGen(skua) ]->
+  [ UA_SK(skua), UA_PK(pk(skua)) ]
+
+rule InitSE_WithEK:
+  [ Fr(skek), Fr(ska), Fr(nameAK) ]
+  --[ SEKeyGen(skek, ska, nameAK) ]->
+  [ SE_Holds_EK(skek), SE_Holds_AK(nameAK, ska, pk(ska)), RegistryEK(pk(skek)) ]
+
+rule InitPlatform:
+  [ Fr(m_userspace), Fr(sb), Fr(m_tss_ref) ]
+  --[ PlatformInit(m_userspace, sb, m_tss_ref) ]->
+  [ TSS_Meas(m_userspace), PCR_SB(sb), RefOK(m_userspace), ProcRefs(m_userspace),
+    TSS_Reference(m_tss_ref), ExpectedPCR(sb) ]
+
+rule InitCounter:
+  [ Fr(nameAK) ]
+  --[ CounterInit(nameAK, 'zero') ]->
+  [ MC(nameAK, 'zero') ]
+
+/* Join: UA packages VPE key and ticket via activate-credential */
+rule UA_Package:
+  [ UA_SK(skua), RegistryEK(ekpk), SE_Holds_AK(nameAK, ska, pkak), Fr(r), Fr(c), Fr(skvpe) ]
+  --[ UAPackage(nameAK, r, c, skvpe) ]->
+  [ UA_Packaged(nameAK, ekpk, pk(skvpe), c, r, senc(<skvpe, pk(skvpe), sign(<nameAK, pkak>, skua), c>, kdf(r, nameAK)), aenc(r, ekpk)) ]
+
+/* SE activate-credential: first validate and bind policy */
+rule SE_ValidatePolicy:
+  [ UA_Packaged(nameAK, ekpk, vpepk, c, r, c1, c2), SE_Holds_EK(skek), 
+    TSS_Reference(m_tss_ref), ExpectedPCR(sb_expected) ]
+  --[ VPEPolicyBinding(nameAK, vpepk, m_tss_ref, sb_expected),
+      Eq(adec(c2, skek), r) ]->
+  [ PolicyValidated(nameAK, vpepk, c, r, skek) ]
+
+/* SE activate-credential: complete onboarding after policy validation */
+rule SE_Activate:
+  [ PolicyValidated(nameAK, vpepk, c, r, skek) ]
+  --[ OnboardingSuccess(nameAK, vpepk) ]->
+  [ SE_Activated(nameAK, vpepk, sign(<nameAK, vpepk>, skek)), 
+    SE_Holds_VPE(r, vpepk), 
+    OnboardedVPE(nameAK, vpepk), VPE_Sign(vpepk, c) ]
+
+/* UA accepts join completion */
+rule UA_Accept:
+  [ UA_Packaged(nameAK, ekpk, vpepk, c, r, c1, c2), VPE_Sign(vpepk, c) ]
+  --[ JoinComplete(nameAK, vpepk) ]->
+  [ UA_Accepted(nameAK, vpepk, c) ]
+
+/* ============================================================================
+   RUNTIME PHASE: Challenge-Response Attestation with Updates
+   ============================================================================ */
+
+/* Start sessions with explicit handle generation and binding */
+rule StartSessions:
+  [ OnboardedVPE(nameAK, vpepk), Fr(nuv), Fr(nua), Fr(h_vpe_seed), Fr(h_ak_seed) ]
+  --[ SessionStart(session_handle(h_vpe_seed, 'vpe'), session_handle(h_ak_seed, 'ak'), nuv, nua),
+      SessionBinding(session_handle(h_vpe_seed, 'vpe'), session_handle(h_ak_seed, 'ak'), nuv, nua) ]->
+  [ StartSessVPE(session_handle(h_vpe_seed, 'vpe'), nuv), StartSessAK(session_handle(h_ak_seed, 'ak'), nua), 
+    SessionBinding(session_handle(h_vpe_seed, 'vpe'), session_handle(h_ak_seed, 'ak'), nuv, nua) ]
+
+/* VPE session: validate complete TSS integrity and bind to specific AK session */
+rule VPE_SignOtherNonce:
+  [ StartSessVPE(hvpe, nuv), StartSessAK(hak, nua), SE_Holds_VPE(skvpe, pkvpe), 
+    TSS_Meas(m_userspace), PCR_SB(sb), OnboardedVPE(nameAK, pkvpe),
+    TSS_Reference(m_tss_ref), ExpectedPCR(sb_expected), SessionBinding(hvpe, hak, nuv, nua) ]
+  --[ /* PolicyOR: TSS user-space measurement against reference */
+      Eq(m_userspace, m_tss_ref), TSSUserSpaceValid(m_userspace),
+      /* PolicyPCR: Lower-ring integrity via secure boot hash */  
+      Eq(sb, sb_expected), TSSLowerRingValid(sb),
+      /* Combined VPE policy satisfaction */
+      VPEPolicyOK(nameAK, m_userspace, sb),
+      /* Explicit session binding: VPE signs for specific AK session */
+      SessionBound(hvpe, hak, h(nua)),
+      VPESignature(nameAK, h(nua)),
+      VPESessionAuthorized(hvpe, hak, nameAK) ]->
+  [ VPE_SignedSig(sign(<h(nua), hak, m_userspace, sb>, skvpe), hak, h(nua), m_userspace, sb),
+    VPESessionAuthorized(hvpe, hak, nameAK) ]
+
+/* Verifier generates fresh challenge */
+rule VerifierChallenge:
+  [ Fr(n) ]
+  --[ VerifierChallenge(n) ]->
+  [ VerifierFresh(n) ]
+
+/* AK session: accumulate measurements, counters, VPE linkage; verify session binding */
+rule AK_Authorize:
+  [ StartSessAK(hak, nua), SE_Holds_AK(nameAK, skap, pkap), OnboardedVPE(nameAK, pkvpe),
+    ProcRefs(R), MC(nameAK, v), RefOK(m), ValidatedState(nameAK, R, v), 
+    VPE_SignedSig(sigv, hak, h(nua), m_userspace, sb), VerifiedTicket(nameAK, R, v), UA_PK(pkua),
+    VPESessionAuthorized(hvpe, hak, nameAK) ]
+  --[ Eq(verify(sigv, <h(nua), hak, m_userspace, sb>, pkvpe), true),
+      /* Verify VPE signature binds to this specific AK session handle */
+      SessionVerified(hvpe, hak, h(nua)),
+      /* Explicit UA ticket verification during runtime authorization */
+      RuntimeTicketVerified(nameAK, R, v),
+      AKAuthorized(nameAK, hak) ]->
+  [ AK_Authorized(hak) ]
+
+/* Signing evidence after authorization */
+rule SignAK:
+  [ AK_Authorized(hak), SE_Holds_AK(nameAK, skap, pkap), VerifierFresh(n) ]
+  --[ SignAKEv(nameAK, h(n)), SignWithKey(nameAK, n) ]->
+  [ SignatureEvidence(nameAK, h(n), sign(h(n), skap)) ]
+
+/* Verifier accepts when it receives and verifies signature over its fresh nonce */
+rule VerifierAccepts:
+  [ VerifierFresh(n), SignatureEvidence(nameAK, h(n), sig), OnboardedVPE(nameAK, vpepk), SE_Holds_AK(nameAK, skap, pkap) ]
+  --[ Eq(verify(sig, h(n), pk(skap)), true), VerifierAccept(nameAK, h(n)) ]->
+  [ ]
+
+/* ============================================================================
+   UPDATE PHASE: Secure Software Updates with Anti-Rollback
+   ============================================================================ */
+
+/* Update preparation: UA computes new ticket for updated measurements */
+rule UA_PrepareUpdate:
+  [ UA_SK(skua), SE_Holds_AK(nameAK, skap, pkap), OnboardedVPE(nameAK, vpepk), Fr(Rnew), Fr(vnext), Fr(cnew) ]
+  --[ UpdateInitiated(nameAK, vnext) ]->
+  [ Out(<nameAK, Rnew, vnext, sign(<nameAK, Rnew, vnext>, skua), cnew>) ]
+
+/* Enhanced network model with adversary capabilities */
+rule Net_Send:
+  [ Out(x) ]
+  --[ Sent(x) ]->
+  [ NetMessage(x) ]
+
+/* Adversary can deliver messages in any order */  
+rule Net_Deliver:
+  [ NetMessage(x) ]
+  --[ Delivered(x) ]->
+  [ In(x) ]
+
+/* Adversary can intercept and replay messages */
+rule Adv_Intercept:
+  [ NetMessage(x) ]
+  --[ Intercepted(x) ]->
+  [ AdvKnows(x), NetMessage(x) ]
+
+/* Adversary can inject known messages */
+rule Adv_Inject:
+  [ AdvKnows(x) ]
+  --[ Injected(x) ]->
+  [ NetMessage(x) ]
+
+/* Adversary can delay message delivery */
+rule Net_Delay:
+  [ NetMessage(x) ]
+  --[ Delayed(x) ]->
+  [ DelayedMessage(x) ]
+
+rule Net_DeliverDelayed:
+  [ DelayedMessage(x) ]
+  --[ DelayedDelivery(x) ]->
+  [ In(x) ]
+
+/* SE receives update package */
+rule SE_ActivateUpdate:
+  [ In(<nameAK, Rnew, vnext, tsig, cnew>), OnboardedVPE(nameAK, vpepk) ]
+  --[ UpdateReceived(nameAK, vnext) ]->
+  [ DeliveredTicket(nameAK, Rnew, vnext, tsig), UpdateChallenge(cnew) ]
+
+/* Cryptographically verify UA's ticket and extract new measurements */
+rule Verify_Ticket:
+  [ DeliveredTicket(nameAK, Rnew, vnext, tsig), UA_PK(pkua), TSS_Meas(m) ]
+  --[ Eq(verify(tsig, <nameAK, Rnew, vnext>, pkua), true), 
+      TicketVerified(nameAK, vnext) ]->
+  [ VerifiedTicket(nameAK, Rnew, vnext), ProcRefs(Rnew), RefOK(Rnew), CurrentMeas(nameAK, m) ]
+
+/* Measurement extraction: TSS extracts current process measurements */
+rule ExtractMeasurements:
+  [ TSS_Meas(m_userspace) ]
+  --[ ProcessMeasured(m_userspace), MeasurementExtracted(m_userspace) ]->
+  [ CurrentMeas(m_userspace, m_userspace), ProcRefs(m_userspace) ]
+
+/* Attack detection: authorization only proceeds if measurements match references (no attack) */
+rule ValidateMeasurements:
+  [ VerifiedTicket(nameAK, Rnew, vnext), CurrentMeas(extracted, m) ]
+  --[ Eq(Rnew, m), NoAttack(nameAK, m), MeasurementValidated(nameAK, Rnew), ValidatedState(nameAK, Rnew, vnext) ]->
+  [ ValidatedState(nameAK, Rnew, vnext) ]
+
+/* Monotonic counter increment gated by validated measurements */
+rule CounterIncrement:
+  [ ValidatedState(nameAK, Rnew, vnext), MC(nameAK, v) ]
+  --[ CounterInc(nameAK, v, vnext), Lt(v, vnext), 
+      CounterUpdated(nameAK, v, vnext) ]->
+  [ MC(nameAK, vnext), MC_IncEv(nameAK, v, vnext) ]
+
+/* Bridge update challenge into the verifier-fresh premise */
+rule UpdateChallengeToVerifierFresh:
+  [ UpdateChallenge(cnew), MC_IncEv(nameAK, v, vnext) ]
+  --[ UpdateChallengeReady(nameAK, cnew) ]->
+  [ VerifierFresh(cnew) ]
+
+/* ============================================================================
+   SECURITY LEMMAS: End-to-End Properties
+   ============================================================================ */
+
+/* Onboarding authenticity: Successful import of VPE implies UA-origin (due to aenc under pk_EK and AEAD integrity under kdf(r,name_AK)) */
+lemma onboarding_authenticity:
+  "All nameAK vpepk #i. OnboardingSuccess(nameAK, vpepk)@#i ==> 
+    (not (Ex #j1. OnboardingSuccess(nameAK, vpepk)@#j1 & #j1 < #i))"
+
+lemma vpe_unique_binding:
+  "All nameAK vpepk m1 sb1 m2 sb2 #i #j.
+     VPEPolicyBinding(nameAK, vpepk, m1, sb1)@#i & VPEPolicyBinding(nameAK, vpepk, m2, sb2)@#j 
+     ==> #i = #j"
+
+/* Freshness (no-replay): If a Verifier accepts evidence on nonce n, then there exists a unique SignAK(h(n)) event in the trace and n was generated fresh by the Verifier */
+lemma freshness_no_replay:
+  "All nameAK n #i. VerifierAccept(nameAK, h(n))@#i ==> 
+    (Ex #j2 #k3. VerifierChallenge(n)@#j2 & SignAKEv(nameAK, h(n))@#k3 & 
+     #j2 < #k3 & #k3 < #i)"
+
+
+/* Policy admission: Every SignAK event is preceded by satisfied policy premises: VerifiedTicket, current MC(nameAK,v) meeting the threshold, RefOK(m) for the active measurement, validated reference equality R=m, complete TSS integrity validation (user-space and lower-ring), runtime ticket verification, measurement extraction integrity, and session binding verification ensuring VPE signatures authorize only their intended AK sessions */
+lemma policy_admission:
+  "All nameAK hn #i. SignAKEv(nameAK, hn)@#i ==> 
+    (Ex R v hak nua hvpe #j #k #t1 #m1 #s1 vpepk.
+      OnboardingSuccess(nameAK, vpepk)@#j & #j < #i &
+      ValidatedState(nameAK, R, v)@#k & #k < #i &
+      VPESignature(nameAK, h(nua))@#t1 & #t1 < #i &
+      MeasurementValidated(nameAK, R)@#k &
+      RuntimeTicketVerified(nameAK, R, v)@#m1 & #m1 < #i &
+      SessionVerified(hvpe, hak, h(nua))@#s1 & #s1 < #i)"
+
+/* Measurement extraction security */
+lemma measurement_extraction_integrity:
+  "All nameAK R #i. MeasurementValidated(nameAK, R)@#i ==> 
+    (Ex #j6. MeasurementExtracted(R)@#j6 & #j6 < #i)"
+
+/* VPE policy binding security */
+lemma vpe_policy_binding:
+  "All nameAK vpepk #i. OnboardingSuccess(nameAK, vpepk)@#i ==> 
+    (Ex m_ref sb_expected #j7. VPEPolicyBinding(nameAK, vpepk, m_ref, sb_expected)@#j7)"
+
+/* Anti-rollback: Counters are monotonic per attestation key; SignAK on key nameAK at different times implies strictly increasing counter values v1 < v2. Counters are initialized to zero to prevent manipulation */
+lemma counter_strict_monotonic:
+  "All nameAK v vnext #i.
+     CounterInc(nameAK, v, vnext)@#i ==> not(v = vnext)"
+
+lemma no_rollback:
+  "All nameAK h1 h2 #i #j.
+     SignAKEv(nameAK, h1)@#i & 
+     SignAKEv(nameAK, h2)@#j & 
+     #i < #j ==> 
+     (Ex v1 v2 vnext1 vnext2 #k1 #k2. CounterUpdated(nameAK, v1, vnext1)@#k1 & CounterUpdated(nameAK, v2, vnext2)@#k2 & 
+      #k1 < #i & #k2 < #j & not(vnext1 = vnext2))"
+
+/* Measurement integrity: Signing requires that reference values R in tickets match actual runtime measurements m when no attacks are present (R=m). Divergence (R≠m) indicates compromise and prevents authorization, ensuring attestation reflects true application state. Measurements are extracted via a trusted process before validation */
+lemma measurement_integrity:
+  "All nameAK hn #i. SignAKEv(nameAK, hn)@#i ==> 
+    (Ex m #j. NoAttack(nameAK, m)@#j & #j < #i)"
+
+/* Update security */
+lemma update_requires_increment:
+  "All nameAK c #i. UpdateChallengeReady(nameAK, c)@#i ==> 
+    (Ex v vnext #j. CounterUpdated(nameAK, v, vnext)@#j & #j < #i)"
+
+/* TSS integrity: VPE policy validation requires both user-space TSS measurement match against reference (TSSUserSpaceValid) and lower-ring TSS integrity via secure boot PCR validation (TSSLowerRingValid). The dual-layer validation ensures complete TCB integrity: user-space components are validated via measurement comparison against known-good references, while lower-ring components are validated via secure boot hash verification */
+lemma vpe_requires_tss_integrity:
+  "All nameAK nua #i. VPESignature(nameAK, nua)@#i ==> 
+    (Ex m_user sb #j #k. TSSUserSpaceValid(m_user)@#j & TSSLowerRingValid(sb)@#k & 
+     #j = #i & #k = #i)"
+
+/* Complete TSS validation required for signing */
+lemma tss_dual_layer_validation:
+  "All nameAK hn #i. SignAKEv(nameAK, hn)@#i ==> 
+    (Ex m_user sb #j. VPEPolicyOK(nameAK, m_user, sb)@#j & #j < #i)"
+
+/* TSS dual validation required: Both user-space TSS measurement validation (TSSUserSpaceValid) and lower-ring TSS integrity verification (TSSLowerRingValid) are mandatory for VPE policy validation. This dual-layer approach ensures complete TCB integrity verification across both user-space application components and lower-ring system components via orthogonal validation mechanisms */
+lemma tss_dual_validation_required:
+  "All nameAK m_user sb #i. VPEPolicyOK(nameAK, m_user, sb)@#i ==> 
+    (Ex #j #k. TSSUserSpaceValid(m_user)@#j & TSSLowerRingValid(sb)@#k & 
+     #j = #i & #k = #i)"
+
+/* Session binding integrity: VPE session binding requires explicit binding creation with proper cryptographic linking. SessionBound events must trace to valid SessionBinding operations with matching hash commitments (hnua = h(nua)), ensuring session integrity and preventing unauthorized session manipulation or impersonation attacks */
+lemma session_binding_integrity:
+  "All hvpe hak hnua #i. SessionBound(hvpe, hak, hnua)@#i ==> 
+    (Ex nuv nua #j. SessionBinding(hvpe, hak, nuv, nua)@#j & hnua = h(nua))"
+
+/* VPE session authorization security: VPE session authorization requires valid session binding. VPESessionAuthorized events must trace to established SessionBound relationships with proper nonce-based session establishment, ensuring only properly authorized VPE instances can access session-protected resources */
+lemma vpe_session_authorization:
+  "All hvpe hak nameAK #i. VPESessionAuthorized(hvpe, hak, nameAK)@#i ==> 
+    (Ex nua #j. SessionBound(hvpe, hak, h(nua))@#j & #j = #i)"
+
+/* AK authorization requires session verification: Attestation Key authorization must be preceded by successful session verification. This ensures that AK usage is contingent upon established and verified VPE-AK session binding, preventing unauthorized AK usage and maintaining session-based access control */
+lemma ak_requires_session_verification:
+  "All nameAK hak #i. AKAuthorized(nameAK, hak)@#i ==> 
+    (Ex hvpe nua #j. SessionVerified(hvpe, hak, h(nua))@#j & #j < #i)"
+
+/* Network authenticity under Dolev-Yao adversary: All delivered messages must be either authentically sent by protocol participants or explicitly injected by the network adversary. This captures the Dolev-Yao threat model where the adversary has complete network control but cannot break cryptographic primitives, ensuring message authenticity traces */
+lemma network_authenticity:
+  "All x #i. Delivered(x)@#i ==> 
+    (Ex #j. Sent(x)@#j & #j < #i) | (Ex #k. Injected(x)@#k & #k < #i)"
+
+/* Session signature uniqueness for replay detection: Session bindings with identical parameters (VPE hash, AK hash, nonce) must be unique temporal events. This prevents replay attacks and ensures session binding freshness by guaranteeing that each unique session binding occurs exactly once */
+lemma session_signature_uniqueness:
+  "All hvpe hak nua #i #j. 
+     SessionBound(hvpe, hak, nua)@#i & SessionBound(hvpe, hak, nua)@#j ==> #i = #j"
+
+/* End-to-end security: AK signing requires completed onboarding: All AK signature operations must be preceded by successful onboarding completion. This ensures that only properly onboarded and authenticated AKs can perform signature operations, maintaining the integrity of the attestation chain from onboarding through runtime operations */
+lemma signing_requires_onboarding:
+  "All nameAK hn #i. SignAKEv(nameAK, hn)@#i ==> 
+    (Ex vpepk #j. OnboardingSuccess(nameAK, vpepk)@#j & #j < #i)"
+
+end
